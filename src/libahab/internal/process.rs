@@ -18,11 +18,11 @@ impl ProcessAddr {
 }
 
 pub trait Process<T> {
-  fn send(&self, dest: &ProcessAddr, msg: T);
-  fn recv(&self) -> (ProcessAddr, T);
+  fn send(&self, dest: &HostAddr, msg: T);
+  fn recv(&self) -> (HostAddr, T);
   fn process(&mut self);
 
-  fn recv_from(&self, exp_src: &ProcessAddr) -> T {
+  fn recv_from(&self, exp_src: &HostAddr) -> T {
     loop {
       let (src, msg) = self.recv();
       if src == *exp_src {

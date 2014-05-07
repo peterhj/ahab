@@ -12,6 +12,10 @@ impl HostAddr {
       sockaddr: SocketAddr{ip: Ipv4Addr(ip0, ip1, ip2, ip3), port: port},
     }
   }
+
+  pub fn default() -> HostAddr {
+    HostAddr::new(127, 0, 0, 1, 6379)
+  }
 }
 
 pub struct NetworkMsg {
