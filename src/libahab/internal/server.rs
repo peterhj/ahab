@@ -1,7 +1,12 @@
 use config::{AhabConfig};
-use internal::protocol::{MasterState, ProtocolMessage, SlaveState, master_process, slave_process};
+//use internal::protocol::{MasterState, ProtocolMessage, SlaveState, master_process, slave_process};
 
-pub enum ProcessMessage {
+pub struct Server;
+
+impl Server {
+}
+
+/*pub enum ProcessMessage {
   Control(ControlMessage),
   Network(NetworkMessage),
   Protocol(ProtocolMessage),
@@ -20,11 +25,16 @@ pub enum NetworkMessage {
   RecvBlocking,
 }
 
-fn spawn_process<S: Send, T: Send>(state: S, process: fn (state: &mut S, port: Receiver<T>)) -> Sender<T> {
+fn spawn_process<S: Send, T: Send>(state: S, process: fn (state: &mut S, msg: T)) -> Sender<T> {
   let (chan, port) = channel::<T>();
   spawn(proc () {
     let mut state = state;
-    process(&mut state, port);
+    loop {
+      match port.recv_opt() {
+        Some(msg) => process(&mut state, msg),
+        None => (),
+      }
+    }
   });
   chan
 }
@@ -44,7 +54,7 @@ impl NetworkState {
   }
 }
 
-fn network_process(state: &mut NetworkState, port: Receiver<ProcessMessage>) {
+fn network_process(state: &mut NetworkState, msg: ProcessMessage) {
   /*match msg {
     Control(msg) => match msg {
       SlaveChan(chan) => (),
@@ -98,4 +108,4 @@ impl Server {
       }
     }
   }
-}
+}*/

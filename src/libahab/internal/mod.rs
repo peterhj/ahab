@@ -1,4 +1,5 @@
-pub mod master;
+pub mod network;
+pub mod process;
 pub mod protocol;
+pub mod rpc;
 pub mod server;
-pub mod slave;
