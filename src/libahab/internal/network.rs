@@ -1,7 +1,7 @@
 use std::io::net::ip::{Ipv4Addr, SocketAddr};
 use std::io::net::tcp::{TcpListener, TcpStream};
 
-#[deriving(Eq, TotalEq)]
+#[deriving(Eq, TotalEq, Hash)]
 pub struct HostAddr {
   sockaddr: SocketAddr,
 }
@@ -15,6 +15,6 @@ impl HostAddr {
 }
 
 pub struct NetworkMsg {
-  dest: SocketAddr,
+  dest: HostAddr,
   value: ~[u8],
 }

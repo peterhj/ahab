@@ -1,9 +1,12 @@
 use config::{AhabConfig, HostId};
+use internal::network::{HostAddr};
 use internal::process::{Process, ProcessAddr, ProcessHelper};
 
+use collections::hashmap::{HashMap, HashSet};
+use collections::treemap::{TreeMap};
 use serialize::{base64, Decodable, Decoder, Encodable, Encoder};
 use serialize::base64::{FromBase64, ToBase64};
-use sync::{Arc};
+use sync::{Arc, Mutex};
 
 macro_rules! match_until (
   ($e:expr, $p:ident($($lhs:pat),*) => $rhs:expr) => ({
@@ -24,13 +27,15 @@ macro_rules! match_until (
 
 pub type Epoch = u64;
 
-#[deriving(Clone, Decodable, Encodable)]
+#[deriving(Clone, Eq, TotalEq, Ord, TotalOrd)]
+#[deriving(Decodable, Encodable)]
 pub struct TxnId {
   epoch: Epoch,
   counter: u64,
 }
 
-#[deriving(Clone, Decodable, Encodable)]
+#[deriving(Clone)]
+#[deriving(Decodable, Encodable)]
 pub enum TxnOp {
   Put(TxnPutOp),
   Delete(TxnDeleteOp),
@@ -68,18 +73,27 @@ impl<E, D: Decoder<E>> Decodable<D, E> for TxnPutOp {
   }
 }
 
-#[deriving(Clone, Decodable, Encodable)]
+#[deriving(Clone)]
+#[deriving(Decodable, Encodable)]
 pub struct TxnDeleteOp {
   key: ~str,
 }
 
-#[deriving(Clone, Decodable, Encodable)]
+#[deriving(Clone)]
+#[deriving(Decodable, Encodable)]
 pub struct Txn {
   xid: TxnId,
   ops: Vec<TxnOp>,
 }
 
-#[deriving(Clone, Decodable, Encodable)]
+impl Txn {
+  pub fn acceptable(&self) -> bool {
+    true
+  }
+}
+
+#[deriving(Clone)]
+#[deriving(Decodable, Encodable)]
 pub enum ProtocolMsg {
   // Discovery phase.
   CurrentEpoch(Epoch),
@@ -91,8 +105,8 @@ pub enum ProtocolMsg {
   CommitMaster(Epoch),
   // Broadcast phase.
   Propose(Epoch, Txn),
-  Ack(Epoch),
-  Commit(Epoch),
+  Ack(Epoch, TxnId),
+  Commit(Epoch, TxnId),
   Heartbeat,
 }
 
@@ -102,10 +116,17 @@ enum ProtocolPhase {
   Broadcast,
 }
 
+enum ProtocolState {
+  Electing,
+  Following,
+  Leading,
+}
+
 pub struct MasterProcess {
   helper: ProcessHelper,
   config: Arc<AhabConfig>,
   phase: ProtocolPhase,
+  quorum: HashSet<HostAddr>,
 }
 
 impl MasterProcess {
@@ -114,6 +135,7 @@ impl MasterProcess {
       helper: ProcessHelper::new(),
       config: config,
       phase: Discovery,
+      quorum: HashSet::new(),
     }
   }
 }
@@ -157,6 +179,9 @@ pub struct SlaveProcess {
   phase: ProtocolPhase,
   last_epoch: Epoch,
   last_master: Option<HostId>,
+  accepted_txns: TreeMap<TxnId, Txn>,
+  committing_txns: TreeMap<TxnId, Txn>,
+  history: Vec<Txn>,
 }
 
 impl SlaveProcess {
@@ -167,6 +192,9 @@ impl SlaveProcess {
       phase: Discovery,
       last_epoch: 0,
       last_master: None,
+      accepted_txns: TreeMap::new(),
+      committing_txns: TreeMap::new(),
+      history: Vec::new(),
     }
   }
 
@@ -174,10 +202,7 @@ impl SlaveProcess {
     HostId(0)
   }
 
-  pub fn accept_txn(&mut self) {
-  }
-
-  pub fn deliver_txn(&mut self) {
+  pub fn commit_txn(&mut self, txn: Txn) {
   }
 }
 
@@ -191,52 +216,114 @@ impl Process<ProtocolMsg> for SlaveProcess {
   }
 
   fn process(&mut self) {
+    let identity = HostId(0);
     let leader = ProcessAddr::new();
-    let dummy_msg = Heartbeat;
     loop {
       match self.phase {
         Discovery => {
-          // Send to leader CurrentEpoch(state.last_epoch).
-          self.send(&leader, dummy_msg.clone());
+          // Send to leader CurrentEpoch(self.last_epoch).
+          self.send(&leader, CurrentEpoch(self.last_epoch));
           // Receive from leader NewEpoch(e).
-          let e = match_until!(self.recv_from(&leader), NewEpoch(e, _) => e);
-          // If state.last_epoch < e, then set state.last_epoch = e, send to
-          // leader AckEpoch(state.last_master, diff), and transition to
+          let (e, last_xid) = match_until!(self.recv_from(&leader), NewEpoch(e, xid) => (e, xid));
+          // If self.last_epoch < e, then set self.last_epoch = e, send to
+          // leader AckEpoch(self.last_master, diff), and transition to
           // Synchronization phase.
           if self.last_epoch < e {
             self.last_epoch = e;
-            self.send(&leader, dummy_msg.clone());
+            self.send(&leader, AckEpoch(identity, Vec::new())); // FIXME
             self.phase = Synchronization;
           }
         },
         Synchronization => {
           // Receive from leader NewMaster(e, diff).
+          // If self.last_epoch != e, then transition to Discovery phase.
           let (e, diff) = match_until!(self.recv_from(&leader), NewMaster(e, diff) => (e, diff));
-          // If state.last_epoch != e, then transition to Discovery phase.
-          if self.last_epoch != e {
+          if e != self.last_epoch {
             self.phase = Discovery;
             continue;
           }
+
           // Atomically:
-          // 1. set state.last_epoch = e,
+          // 1. set self.last_epoch = e,
           // 2. for each txn in diff, accept txn.
-          // FIXME
+          // (If failure, then transition to Discovery phase.)
+          let accepted_txns = {
+            let mut accepted_txns = Vec::<Txn>::new();
+            let mut diff_accepted = true;
+            for txn in diff.move_iter() {
+              if txn.acceptable() {
+                accepted_txns.push(txn);
+              } else {
+                diff_accepted = false;
+                break;
+              }
+            }
+            if diff_accepted {
+              self.last_epoch = e;
+            } else {
+              self.phase = Discovery;
+              continue;
+            }
+            accepted_txns
+          };
+
           // Send to leader AckMaster.
-          self.send(&leader, dummy_msg.clone());
+          self.send(&leader, AckMaster(self.last_epoch));
+
           // Receive from leader CommitMaster.
+          // (If self.last_epoch != e, then transition to Discovery phase.)
           let e = match_until!(self.recv_from(&leader), CommitMaster(e) => e);
-          // For each txn in state.history, deliver txn.
+          if e != self.last_epoch {
+            self.phase = Discovery;
+            continue;
+          }
+
+          // For each accepted txn, deliver txn.
+          for txn in accepted_txns.move_iter() {
+            self.commit_txn(txn);
+          }
+
           // Transition to Broadcast phase.
+          // If self.infer_master() is itself, invoke self.ready(e).
           self.phase = Broadcast;
-          // If state.infer_master() is itself, invoke state.ready(e).
-          if self.infer_master() == HostId(0) { // FIXME
+          if identity == self.infer_master() {
+            // FIXME
           }
         },
         Broadcast => {
-          // Forever: accept proposed txns from leader and append each txn to
-          // state.history.
-          // Upon receiving from leader Commit(e, txn), and when all txn' s.t.
-          // txn' < txn are committed, commit txn.
+          match self.recv_from(&leader) {
+            Propose(e, txn) => {
+              // Accept proposed txns from leader and append each txn to
+              // self.history.
+              self.accepted_txns.insert(txn.xid, txn);
+            },
+            Commit(e, xid) => {
+              // Upon receiving from leader Commit(e, txn), and when all txn'
+              // s.t. txn' < txn are committed, commit txn.
+              match self.accepted_txns.pop(&xid) {
+                Some(txn) => {
+                  self.committing_txns.insert(xid, txn);
+                },
+                None => (),
+              }
+              let mut to_commit_xids = Vec::<TxnId>::new();
+              'commit_all: for (&xid, txn) in self.committing_txns.iter() {
+                for (&acc_xid, acc_txn) in self.accepted_txns.iter() {
+                  if acc_xid < xid {
+                    break 'commit_all;
+                  } else {
+                    break;
+                  }
+                }
+                to_commit_xids.push(xid);
+              }
+              for xid in to_commit_xids.iter() {
+                let txn = self.committing_txns.pop(xid).unwrap();
+                self.commit_txn(txn);
+              }
+            },
+            _ => (),
+          }
         },
       }
     }
