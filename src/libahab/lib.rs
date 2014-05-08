@@ -14,7 +14,6 @@ extern crate serialize;
 extern crate sync;
 
 pub mod client;
-pub mod config;
 pub mod server;
 
 mod internal;

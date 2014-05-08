@@ -1,7 +1,13 @@
+use collections::hashmap::{HashMap};
 use std::io::net::ip::{Ipv4Addr, SocketAddr};
 use std::io::net::tcp::{TcpListener, TcpStream};
 
-#[deriving(Eq, TotalEq, Hash)]
+#[deriving(Clone, Eq, TotalEq, Ord, TotalOrd)]
+#[deriving(Hash, Decodable, Encodable)]
+pub struct HostId(u32);
+
+#[deriving(Clone, Eq, TotalEq)]
+#[deriving(Hash)]
 pub struct HostAddr {
   sockaddr: SocketAddr,
 }
@@ -16,6 +22,16 @@ impl HostAddr {
   pub fn default() -> HostAddr {
     HostAddr::new(127, 0, 0, 1, 6379)
   }
+}
+
+#[deriving(Clone)]
+pub struct HostInfo {
+  id: HostId,
+  addr: HostAddr,
+}
+
+pub struct Quorum {
+  hosts: HashMap<HostId, HostInfo>,
 }
 
 pub struct NetworkMsg {

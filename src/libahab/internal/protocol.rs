@@ -1,6 +1,6 @@
-use config::{AhabConfig, HostId};
-use internal::network::{HostAddr};
-use internal::process::{Process, HostAddr, ProcessHelper};
+use internal::config::{StaticConfig};
+use internal::network::{HostId};
+use internal::process::{Process, ProcessHelper};
 
 use collections::hashmap::{HashMap, HashSet};
 use collections::treemap::{TreeMap};
@@ -113,9 +113,29 @@ impl Txn {
 
 #[deriving(Clone)]
 #[deriving(Decodable, Encodable)]
+enum ProtocolPhase {
+  Election,
+  Discovery,
+  Synchronization,
+  Broadcast,
+}
+
+#[deriving(Clone)]
+#[deriving(Decodable, Encodable)]
+enum ProtocolState {
+  Voting,
+  Following,
+  Leading,
+}
+
+#[deriving(Clone)]
+#[deriving(Decodable, Encodable)]
 pub enum ProtocolMsg {
-  Heartbeat,
   Timeout,
+  TimeoutAll,
+  Heartbeat,
+  // Leader election.
+  Notify(Vote),
   // Discovery phase.
   CurrentEpoch(Epoch),
   NewEpoch(Epoch, TxnId),
@@ -132,27 +152,23 @@ pub enum ProtocolMsg {
   Commit(Epoch, TxnId),
 }
 
-enum ProtocolPhase {
-  Discovery,
-  Synchronization,
-  Broadcast,
+#[deriving(Clone)]
+#[deriving(Decodable, Encodable)]
+struct Vote {
+  epoch: Epoch,
+  state: ProtocolState,
+  leader: HostId,
+  leader_xid: TxnId,
+  leader_epoch: Epoch,
 }
 
-enum ProtocolState {
-  Electing,
-  Following,
-  Leading,
-}
-
-pub struct SharedState {
-  identity: HostId,
+pub struct SharedData {
   history: Vec<Txn>,
 }
 
-impl SharedState {
-  pub fn new() -> SharedState {
-    SharedState{
-      identity: HostId(0),
+impl SharedData {
+  pub fn new() -> SharedData {
+    SharedData{
       history: Vec::new(),
     }
   }
@@ -160,61 +176,57 @@ impl SharedState {
 
 pub struct MasterProcess {
   helper: ProcessHelper,
-  config: Arc<AhabConfig>,
+  config: Arc<StaticConfig>,
+  shared: Arc<RWLock<SharedData>>,
+  state: ProtocolState,
   phase: ProtocolPhase,
-  quorum: HashSet<HostAddr>,
+  quorum: HashSet<HostId>,
   epoch: Epoch,
-  shared: Arc<RWLock<SharedState>>,
 }
 
 impl MasterProcess {
-  pub fn new(config: Arc<AhabConfig>) -> MasterProcess {
+  pub fn new(config: Arc<StaticConfig>, shared: Arc<RWLock<SharedData>>) -> MasterProcess {
     MasterProcess{
       helper: ProcessHelper::new(),
       config: config,
-      phase: Discovery,
+      shared: shared,
+      state: Voting,
+      phase: Election,
       quorum: HashSet::new(),
       epoch: 0,
-      shared: Arc::new(RWLock::new(SharedState::new())),
     }
-  }
-
-  pub fn quorum_min_size(&self) -> uint {
-    3
-  }
-
-  pub fn quorum_max_size(&self) -> uint {
-    5
   }
 }
 
 impl Process<ProtocolMsg> for MasterProcess {
-  fn send(&self, dest: &HostAddr, msg: ProtocolMsg) {
+  fn send(&self, dest: &HostId, msg: ProtocolMsg) {
   }
 
-  fn recv(&self) -> (HostAddr, ProtocolMsg) {
+  fn recv(&self) -> (HostId, ProtocolMsg) {
     self.helper.recv();
-    (HostAddr::default(), Heartbeat)
+    (HostId(0), Heartbeat) // FIXME
   }
 
   fn process(&mut self) {
-    let identity = HostAddr::default();
+    let identity = HostId(0);
     match self.phase {
+      Election => {
+      },
       Discovery => {
         // Receive from a quorum of followers CurrentEpoch(e).
-        let mut quorum_epochs = HashMap::<HostAddr, Epoch>::new();
+        let mut quorum_epochs = HashMap::<HostId, Epoch>::new();
         loop {
           match self.recv() {
-            (addr, msg) => match msg {
+            (host, msg) => match msg {
               CurrentEpoch(e) => {
-                self.quorum.insert(addr);
-                quorum_epochs.insert(addr, e);
-                if self.quorum.len() == self.quorum_max_size() {
+                self.quorum.insert(host);
+                quorum_epochs.insert(host, e);
+                if self.quorum.len() == self.config.quorum_max_size() {
                   break;
                 }
               },
               Timeout => {
-                if self.quorum.len() >= self.quorum_min_size() {
+                if self.quorum.len() >= self.config.quorum_min_size() {
                   break;
                 }
               },
@@ -232,26 +244,26 @@ impl Process<ProtocolMsg> for MasterProcess {
           sup_epoch + 1
         };
         assert!(self.epoch != 0);
-        for (addr, _) in quorum_epochs.iter() {
+        for (host, _) in quorum_epochs.iter() {
           // FIXME read txn history from master process?
-          self.send(addr, NewEpoch(self.epoch, TxnId::lower_bound()));
+          self.send(host, NewEpoch(self.epoch, TxnId::lower_bound()));
         }
 
         // Receive from quorum AckEpoch(m, diff).
-        let mut quorum_xids = HashMap::<HostAddr, TxnId>::new();
+        let mut quorum_xids = HashMap::<HostId, TxnId>::new();
         loop {
           match self.recv() {
-            (addr, msg) => match msg {
+            (host, msg) => match msg {
               AckEpoch(e, xid) => {
-                if self.quorum.contains(&addr) {
-                  quorum_xids.insert(addr, xid);
+                if self.quorum.contains(&host) {
+                  quorum_xids.insert(host, xid);
                 }
-                if quorum_xids.len() == self.quorum_max_size() {
+                if quorum_xids.len() == self.config.quorum_max_size() {
                   break;
                 }
               },
               Timeout => {
-                if quorum_xids.len() >= self.quorum_min_size() {
+                if quorum_xids.len() >= self.config.quorum_min_size() {
                   break;
                 }
               },
@@ -264,9 +276,9 @@ impl Process<ProtocolMsg> for MasterProcess {
         let chosen_host = {
           let mut chosen_host = identity;
           let mut sup_xid = TxnId::lower_bound();
-          for (&addr, &xid) in quorum_xids.iter() {
+          for (&host, &xid) in quorum_xids.iter() {
             if xid > sup_xid {
-              chosen_host = addr;
+              chosen_host = host;
               sup_xid = xid;
             }
           }
@@ -308,74 +320,192 @@ impl Process<ProtocolMsg> for MasterProcess {
 
 pub struct SlaveProcess {
   helper: ProcessHelper,
-  config: Arc<AhabConfig>,
+  config: Arc<StaticConfig>,
+  shared: Arc<RWLock<SharedData>>,
+  state: ProtocolState,
   phase: ProtocolPhase,
-  last_epoch_prop: Epoch,
-  last_master_prop: Epoch,
+  election_clock: Epoch,
+  received_votes: HashMap<HostId, Vote>,
+  out_of_election: HashMap<HostId, Vote>,
+  last_epoch_proposal: Epoch,
+  last_master_proposal: Epoch,
   accepted_txns: TreeMap<TxnId, Txn>,
-  committing_txns: TreeMap<TxnId, Txn>,
-  shared: Arc<RWLock<SharedState>>,
+  ready_txns: TreeMap<TxnId, Txn>,
 }
 
 impl SlaveProcess {
-  pub fn new(config: Arc<AhabConfig>) -> SlaveProcess {
+  pub fn new(config: Arc<StaticConfig>, shared: Arc<RWLock<SharedData>>) -> SlaveProcess {
     SlaveProcess{
       helper: ProcessHelper::new(),
       config: config,
-      phase: Discovery,
-      last_epoch_prop: 0,
-      last_master_prop: 0,
+      shared: shared,
+      state: Voting,
+      phase: Election,
+      election_clock: 0,
+      received_votes: HashMap::new(),
+      out_of_election: HashMap::new(),
+      last_epoch_proposal: 0,
+      last_master_proposal: 0,
       accepted_txns: TreeMap::new(),
-      committing_txns: TreeMap::new(),
-      //history: Vec::new(),
-      shared: Arc::new(RWLock::new(SharedState::new())),
+      ready_txns: TreeMap::new(),
+    }
+  }
+
+  pub fn send_all(&self, msg: ProtocolMsg) {
+    for (host, _) in self.config.hosts.iter() {
+      self.send(host, msg.clone());
+    }
+  }
+
+  pub fn recv_notify(&mut self) -> (HostId, ProtocolMsg) {
+    loop {
+      match self.recv() {
+        // Receive vote notification from a peer.
+        (host, Notify(vote)) => {
+          let peer_is_looking = match vote.state {
+            Voting => true,
+            _ => false,
+          };
+          let peer_is_lagged = true; // FIXME
+          match self.state {
+            // If self is looking, the peer is looking, and the peer is
+            // lagged, then respond with the leader candidate.
+            Voting => {
+              if peer_is_looking && peer_is_lagged {
+                self.send(&host, Notify(self.vote()));
+              }
+            },
+            // Otherwise, if the peer is looking, then respond with the
+            // proposed leader.
+            _ => {
+              if peer_is_looking {
+                self.send(&host, Notify(self.final_vote()));
+              }
+            },
+          }
+          return (host, Notify(vote));
+        },
+        _ => (),
+      }
+    }
+  }
+
+  pub fn predicate_total_order(&self, other: &Vote) -> bool {
+    true
+  }
+
+  pub fn predicate_termination(&self, other: &Vote) -> bool {
+    true
+  }
+
+  pub fn predicate_valid_leader(&self, leader: HostId, epoch: Epoch) -> bool {
+    if leader != self.config.identity {
+      match self.received_votes.find(&leader) {
+        Some(vote) => match vote.state {
+          Leading => true,
+          _ => false,
+        },
+        None => false,
+      }
+    } else if epoch != self.election_clock {
+      false
+    } else {
+      true
     }
   }
 
   pub fn infer_master(&self) -> HostId {
     HostId(0)
   }
+
+  pub fn vote(&self) -> Vote {
+    Vote{
+      epoch: 0,
+      state: self.state,
+      leader: HostId(0),
+      leader_xid: TxnId{epoch: 0, tick: 0},
+      leader_epoch: 0,
+    }
+  }
+
+  pub fn final_vote(&self) -> Vote {
+    Vote{
+      epoch: 0,
+      state: self.state,
+      leader: HostId(0),
+      leader_xid: TxnId{epoch: 0, tick: 0},
+      leader_epoch: 0,
+    }
+  }
 }
 
 impl Process<ProtocolMsg> for SlaveProcess {
-  fn send(&self, dest: &HostAddr, msg: ProtocolMsg) {
+  fn send(&self, dest: &HostId, msg: ProtocolMsg) {
   }
 
-  fn recv(&self) -> (HostAddr, ProtocolMsg) {
+  fn recv(&self) -> (HostId, ProtocolMsg) {
     self.helper.recv();
-    (HostAddr::default(), Heartbeat)
+    (HostId(0), Heartbeat) // FIXME
   }
 
   fn process(&mut self) {
     let identity = HostId(0);
-    let leader = HostAddr::default();
+    let leader = HostId(0);
     loop {
       match self.phase {
+        Election => {
+          let (host, vote) = match self.recv_notify() {
+            (host, Notify(vote)) => (host, vote),
+            // If not enough notifications received, send more.
+            (_, TimeoutAll) => {
+              self.send_all(Notify(self.vote()));
+              continue;
+            },
+            _ => continue,
+          };
+          match vote.state {
+            Voting => {
+              if vote.epoch > self.election_clock {
+                // TODO
+              } else if vote.epoch < self.election_clock {
+                // TODO
+              } else if true { // FIXME
+              }
+            },
+            Following | Leading => {
+              // Consider notifications from the same epoch.
+              if vote.epoch == self.election_clock {
+              }
+              // Verify that a quorum is following the same leader.
+              // TODO
+            },
+          }
+        },
         Discovery => {
-          // Send to leader CurrentEpoch(self.last_epoch_prop).
-          self.send(&leader, CurrentEpoch(self.last_epoch_prop));
+          // Send to leader CurrentEpoch(self.last_epoch_proposal).
+          self.send(&leader, CurrentEpoch(self.last_epoch_proposal));
           // Receive from leader NewEpoch(e).
           let (e, last_xid) = match_until!(self.recv_from(&leader), NewEpoch(e, xid) => (e, xid));
-          // If self.last_epoch_prop < e, then set self.last_epoch_prop = e, send to
-          // leader AckEpoch(self.last_master_prop, diff), and transition to
+          // If self.last_epoch_proposal < e, then set self.last_epoch_proposal = e, send to
+          // leader AckEpoch(self.last_master_proposal, diff), and transition to
           // Synchronization phase.
-          if self.last_epoch_prop < e {
-            self.last_epoch_prop = e;
-            self.send(&leader, AckEpoch(self.last_master_prop, TxnId::lower_bound())); // FIXME
+          if self.last_epoch_proposal < e {
+            self.last_epoch_proposal = e;
+            self.send(&leader, AckEpoch(self.last_master_proposal, TxnId::lower_bound())); // FIXME
             self.phase = Synchronization;
           }
         },
         Synchronization => {
           // Receive from leader NewMaster(e, diff).
-          // If self.last_epoch_prop != e, then transition to Discovery phase.
+          // If self.last_epoch_proposal != e, then transition to Discovery phase.
           let (e, diff) = match_until!(self.recv_from(&leader), NewMaster(e, diff) => (e, diff));
-          if e != self.last_epoch_prop {
+          if e != self.last_epoch_proposal {
             self.phase = Discovery;
             continue;
           }
 
           // Atomically:
-          // 1. set self.last_epoch_prop = e,
+          // 1. set self.last_epoch_proposal = e,
           // 2. for each txn in diff, accept txn.
           // (If failure, then transition to Discovery phase.)
           let accepted_txns = {
@@ -390,7 +520,7 @@ impl Process<ProtocolMsg> for SlaveProcess {
               }
             }
             if diff_accepted {
-              self.last_master_prop = e;
+              self.last_master_proposal = e;
             } else {
               self.phase = Discovery;
               continue;
@@ -399,12 +529,12 @@ impl Process<ProtocolMsg> for SlaveProcess {
           };
 
           // Send to leader AckMaster.
-          self.send(&leader, AckMaster(self.last_epoch_prop));
+          self.send(&leader, AckMaster(self.last_epoch_proposal));
 
           // Receive from leader CommitMaster.
-          // (If self.last_epoch_prop != e, then transition to Discovery phase.)
+          // (If self.last_epoch_proposal != e, then transition to Discovery phase.)
           let e = match_until!(self.recv_from(&leader), CommitMaster(e) => e);
-          if e != self.last_epoch_prop {
+          if e != self.last_epoch_proposal {
             self.phase = Discovery;
             continue;
           }
@@ -436,12 +566,12 @@ impl Process<ProtocolMsg> for SlaveProcess {
               // s.t. txn' < txn are committed, commit txn.
               match self.accepted_txns.pop(&xid) {
                 Some(txn) => {
-                  self.committing_txns.insert(xid, txn);
+                  self.ready_txns.insert(xid, txn);
                 },
                 None => (),
               }
               let mut to_commit_xids = Vec::<TxnId>::new();
-              'commit_all: for (&xid, txn) in self.committing_txns.iter() {
+              'commit_all: for (&xid, txn) in self.ready_txns.iter() {
                 for (&acc_xid, acc_txn) in self.accepted_txns.iter() {
                   if acc_xid < xid {
                     break 'commit_all;
@@ -454,7 +584,7 @@ impl Process<ProtocolMsg> for SlaveProcess {
               {
                 let mut shared = self.shared.write();
                 for xid in to_commit_xids.iter() {
-                  let txn = self.committing_txns.pop(xid).unwrap();
+                  let txn = self.ready_txns.pop(xid).unwrap();
                   shared.history.push(txn);
                 }
               }

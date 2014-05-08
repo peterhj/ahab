@@ -1,4 +1,4 @@
-use config::{AhabConfig};
+use internal::config::{StaticConfig};
 //use internal::protocol::{MasterState, ProtocolMessage, SlaveState, master_process, slave_process};
 
 pub struct Server;

@@ -1,28 +1,13 @@
-use internal::network::{HostAddr, NetworkMsg};
+use internal::network::{HostId, NetworkMsg};
 
 pub type ProcessId = u32;
 
-#[deriving(Eq, TotalEq)]
-pub struct ProcessAddr {
-  host: HostAddr,
-  pid: ProcessId,
-}
-
-impl ProcessAddr {
-  pub fn new() -> ProcessAddr {
-    ProcessAddr{
-      host: HostAddr::new(127, 0, 0, 1, 0),
-      pid: 0,
-    }
-  }
-}
-
 pub trait Process<T> {
-  fn send(&self, dest: &HostAddr, msg: T);
-  fn recv(&self) -> (HostAddr, T);
+  fn send(&self, dest: &HostId, msg: T);
+  fn recv(&self) -> (HostId, T);
   fn process(&mut self);
 
-  fn recv_from(&self, exp_src: &HostAddr) -> T {
+  fn recv_from(&self, exp_src: &HostId) -> T {
     loop {
       let (src, msg) = self.recv();
       if src == *exp_src {
@@ -46,9 +31,9 @@ impl ProcessHelper {
     }
   }
 
-  pub fn send(&self, dest: &ProcessAddr, msg: NetworkMsg) {
+  pub fn send(&self, dest: &HostId, msg: NetworkMsg) {
   }
 
-  pub fn recv(&self) { // -> (ProcessAddr, NetworkMsg) {
+  pub fn recv(&self) { // -> (HostId, NetworkMsg) {
   }
 }
