@@ -145,7 +145,17 @@ enum ProtocolState {
 }
 
 pub struct SharedState {
+  identity: HostId,
   history: Vec<Txn>,
+}
+
+impl SharedState {
+  pub fn new() -> SharedState {
+    SharedState{
+      identity: HostId(0),
+      history: Vec::new(),
+    }
+  }
 }
 
 pub struct MasterProcess {
@@ -165,7 +175,7 @@ impl MasterProcess {
       phase: Discovery,
       quorum: HashSet::new(),
       epoch: 0,
-      shared: Arc::new(RWLock::new(SharedState{history: Vec::new()})),
+      shared: Arc::new(RWLock::new(SharedState::new())),
     }
   }
 
@@ -276,6 +286,7 @@ impl Process<ProtocolMsg> for MasterProcess {
         // (Receive from chosen follower AckEpochHistory(e', diff).)
         let (e, diff) = match_until!(self.recv_from(&chosen_host), AckEpochHistory(e, diff) => (e, diff));
         assert!(e == self.epoch);
+        // TODO adjust the dual follower history w/ the diff.
 
         // Transition to Synchronization phase.
         self.phase = Synchronization;
@@ -317,7 +328,7 @@ impl SlaveProcess {
       accepted_txns: TreeMap::new(),
       committing_txns: TreeMap::new(),
       //history: Vec::new(),
-      shared: Arc::new(RWLock::new(SharedState{history: Vec::new()})),
+      shared: Arc::new(RWLock::new(SharedState::new())),
     }
   }
 
