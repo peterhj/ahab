@@ -1,0 +1,100 @@
+# Fast Leader Election
+
+type ServerId
+type Epoch
+type State
+type Vote
+type Xid
+
+let mut logical_clock := Epoch(0) # FIXME
+let mut received_set := Map<ServerId, (Epoch, State, Vote)>()
+let mut out_of_election_set := Map<ServerId, (State, Vote)>()
+
+atomic {
+  logical_clock += 1
+  UpdateProposal(Vote(GetInitId(), GetInitLastLoggedXid(), GetPeerEpoch()))
+}
+NotifyAll()
+while GetPeerState() == VOTING {
+  let n := match RecvNotification() {
+    Some(note) => note,
+    None => {
+      NotifyAll()
+      continue
+    },
+  }
+  match n.state {
+    VOTING => {
+      if n.election_epoch > logical_clock {
+        logical_clock = n.election_epoch
+        received_set.Clear()
+        if TotalOrderPredicate(Vote(n.leader, n.xid, n.peer_epoch), Vote(GetInitId(), GetInitLastLoggedXid(), GetPeerEpoch())) {
+          UpdateProposal(Vote(n.leader, n.xid, n.peer_epoch))
+        } else {
+          UpdateProposal(Vote(GetInitId(), GetInitLastLoggedXid(), GetPeerEpoch()))
+        }
+        NotifyAll()
+      } else if n.election_epoch < logical_clock {
+        break
+      } else if TotalOrderPredicate(Vote(n.leader, n.xid, n.peer_epoch), Vote(proposed_leader, proposed_xid, proposed_epoch)) {
+        UpdateProposal(Vote(n.leader, n.xid, n.peer_epoch))
+        NotifyAll()
+      }
+      received_set.Put(n.sid, VOTING, (n.election_epoch, Vote(n.leader, n.xid, n.peer_epoch)))
+      if TerminationPredicate(received_set, (logical_clock, Vote(proposed_leader, proposed_xid, proposed_epoch))) {
+        let mut n'
+        loop {
+          n' = PeekNotification()
+          match n' {
+            Some(n') => {
+              if TotalOrderPredicate(Vote(n'.leader, n'.xid, n'.peer_epoch), Vote(proposed_leader, proposed_xid, proposed_epoch)) {
+                break
+              }
+            },
+            None => break,
+          }
+          if n'.IsNone() {
+            break
+          }
+        }
+        if n'.IsNone() {
+          if proposed_leader == GetId() {
+            SetPeerState(LEADING)
+          } else {
+            SetPeerState(FOLLOWING)
+          }
+          return LeaveInstance(Vote(proposed_leader, proposed_xid, proposed_epoch))
+        }
+      }
+    },
+    FOLLOWING | LEADING => {
+      if n.election_epoch == logical_clock {
+        received_set.Put(n.sid, (n.election_epoch, n.state, Vote(n.leader, n.xid, n.peer_epoch)))
+        if TerminationPredicate(received_set, (n.election_epoch, n.state, Vote(n.leader, n.xid, n.peer_epoch))) and
+           CheckLeader(out_of_election, n.leader, n.election_epoch)
+        {
+          if n.leader == GetId() {
+            SetPeerState(LEADING)
+          } else {
+            SetPeerState(FOLLOWING)
+          }
+          return LeaveInstance(Vote(n.leader, n.xid, n.peer_epoch))
+        }
+      }
+      out_of_election_set.Put(n.sid, (n.state, Vote(n.leader, IGNORED, n.peer_epoch)))
+      if TerminationPredicate(out_of_election_set, (IGNORED, n.state, Vote(n.leader, IGNORED, n.peer_epoch))) and
+         CheckLeader(out_of_election_set, n.leader, IGNORED)
+      {
+        atomic {
+          logical_clock = n.election_epoch
+          if n.leader == GetId() {
+            SetPeerState(LEADING)
+          } else {
+            SetPeerState(FOLLOWING)
+          }
+        }
+        return LeaveInstance(Vote(n.leader, n.xid, n.peer_epoch))
+      }
+    },
+  }
+}
