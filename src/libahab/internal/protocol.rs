@@ -25,7 +25,6 @@ macro_rules! match_until (
   })
 )
 
-//#[deriving(Clone, TotalEq, TotalOrd)]
 #[deriving(Clone, Eq, TotalEq, Ord, TotalOrd)]
 #[deriving(Decodable, Encodable)]
 pub struct Epoch(u64);
@@ -64,8 +63,8 @@ struct Vote {
   epoch: Epoch,
   state: State,
   leader: HostId,
-  leader_xid: TxnId,
   leader_epoch: Epoch,
+  leader_xid: TxnId,
 }
 
 impl Vote {
@@ -138,7 +137,6 @@ impl MasterProcess {
 
   fn discovery_process(&mut self) {
     let identity = HostId(0);
-
     // Receive from a quorum of followers CurrentEpoch(e).
     let mut quorum_epochs = HashMap::<HostId, Epoch>::new();
     loop {
@@ -160,7 +158,6 @@ impl MasterProcess {
         },
       }
     }
-
     // Send to quorum NewEpoch(e') s.t. e' = max(e received from quorum) + 1.
     self.epoch = {
       let mut sup_epoch = Epoch(0);
@@ -174,7 +171,6 @@ impl MasterProcess {
       // FIXME read txn history from master process?
       self.send(host, NewEpoch(self.epoch, TxnId::lower_bound()));
     }
-
     // Receive from quorum AckEpoch(m, diff).
     let mut quorum_xids = HashMap::<HostId, TxnId>::new();
     loop {
@@ -197,7 +193,6 @@ impl MasterProcess {
         }
       }
     }
-
     // Select a follower in quorum and its diff.
     let chosen_host = {
       let mut chosen_host = identity;
@@ -210,7 +205,6 @@ impl MasterProcess {
       }
       chosen_host
     };
-
     // (Send to chosen follower ReqEpochHistory(e', xid').)
     let last_xid = {
       let shared = self.shared.read();
@@ -220,12 +214,10 @@ impl MasterProcess {
       }
     };
     self.send(&chosen_host, ReqEpochHistory(self.epoch, last_xid));
-
     // (Receive from chosen follower AckEpochHistory(e', diff).)
     let (e, diff) = match_until!(self.recv_from(&chosen_host), AckEpochHistory(e, diff) => (e, diff));
     assert!(e == self.epoch);
     // TODO adjust the colo follower history w/ the diff.
-
     // Transition to Synchronization phase.
     self.phase = Synchronization;
   }
@@ -343,8 +335,8 @@ pub struct ReplicaProcess {
   state: State,
   phase: Phase,
   election_proposal: RWLock<Vote>,
-  discovery_epoch: Epoch,
-  sync_epoch: RWLock<Epoch>,
+  accepted_epoch: Epoch,
+  current_epoch: RWLock<Epoch>,
   accepted_txns: TreeMap<TxnId, Txn>,
   ready_txns: TreeMap<TxnId, Txn>,
 }
@@ -361,34 +353,34 @@ impl ReplicaProcess {
         epoch: Epoch(0),
         state: Voting,
         leader: HostId(0),
-        leader_xid: TxnId::lower_bound(),
         leader_epoch: Epoch(0),
+        leader_xid: TxnId::lower_bound(),
       }),
-      discovery_epoch: Epoch(0),
-      sync_epoch: RWLock::new(Epoch(0)),
+      accepted_epoch: Epoch(0),
+      current_epoch: RWLock::new(Epoch(0)),
       accepted_txns: TreeMap::new(),
       ready_txns: TreeMap::new(),
     }
   }
 
-  pub fn infer_master(&self) -> HostId {
-    HostId(0)
-  }
-
-  pub fn send_all(&self, msg: ProtocolMsg) {
+  fn send_all(&self, msg: ProtocolMsg) {
     for (host, _) in self.config.hosts.iter() {
       // FIXME to itself too?
       self.send(host, msg.clone());
     }
   }
 
-  fn initial_vote(&self) -> Vote {
+  fn infer_master(&self) -> HostId {
+    HostId(0)
+  }
+
+  fn self_vote(&self) -> Vote {
     Vote{
       epoch: Epoch(0),
       state: Voting,
-      leader: HostId(0),
+      leader: self.config.identity,
+      leader_epoch: *self.current_epoch.read(),
       leader_xid: TxnId::lower_bound(),
-      leader_epoch: Epoch(0),
     }
   }
 
@@ -475,7 +467,10 @@ impl ReplicaProcess {
 
   fn election_update_proposal(&mut self, new_vote: &Vote) {
     let mut election_proposal = self.election_proposal.write();
-    *election_proposal = *new_vote;
+    election_proposal.state = self.state;
+    election_proposal.leader = new_vote.leader;
+    election_proposal.leader_epoch = new_vote.leader_epoch;
+    election_proposal.leader_xid = new_vote.leader_xid;
   }
 
   fn election_leave(&mut self, final_vote: &Vote) {
@@ -489,7 +484,14 @@ impl ReplicaProcess {
   fn election_process(&mut self) {
     let mut received_set = HashMap::<HostId, Vote>::new();
     let mut out_of_election = HashMap::<HostId, Vote>::new();
-    let initial_vote = self.initial_vote();
+    {
+      let mut election_proposal = self.election_proposal.write();
+      election_proposal.epoch = election_proposal.epoch.inc();
+      election_proposal.state = Voting;
+      election_proposal.leader = self.config.identity;
+      election_proposal.leader_epoch = *self.current_epoch.read();
+      election_proposal.leader_xid = TxnId::lower_bound();
+    }
     loop {
       let (host, vote) = match self.election_recv() {
         (host, Notify(vote)) => (host, vote),
@@ -507,14 +509,15 @@ impl ReplicaProcess {
           if vote.epoch > election_epoch {
             self.election_proposal.write().epoch = vote.epoch;
             received_set.clear();
-            if self.total_order_predicate(&vote, &initial_vote) {
+            let self_vote = self.self_vote();
+            if self.total_order_predicate(&vote, &self_vote) {
               self.election_update_proposal(&vote);
             } else {
-              self.election_update_proposal(&initial_vote);
+              self.election_update_proposal(&self_vote);
             }
             self.election_notify_all();
           } else if vote.epoch < election_epoch {
-            break;
+            return;
           } else if self.total_order_predicate(&vote, &*self.election_proposal.read()) {
             self.election_update_proposal(&vote);
             self.election_notify_all();
@@ -580,16 +583,16 @@ impl ReplicaProcess {
   fn discovery_process(&mut self) {
     let identity = HostId(0);
     let leader = HostId(0);
-    // Send to leader CurrentEpoch(self.discovery_epoch).
-    self.send(&leader, CurrentEpoch(self.discovery_epoch));
+    // Send to leader CurrentEpoch(self.accepted_epoch).
+    self.send(&leader, CurrentEpoch(self.accepted_epoch));
     // Receive from leader NewEpoch(e).
     let (e, last_xid) = match_until!(self.recv_from(&leader), NewEpoch(e, xid) => (e, xid));
-    // If self.discovery_epoch < e, then set self.discovery_epoch = e, send to
-    // leader AckEpoch(self.sync_epoch, diff), and transition to
+    // If self.accepted_epoch < e, then set self.accepted_epoch = e, send to
+    // leader AckEpoch(self.current_epoch, diff), and transition to
     // Synchronization phase.
-    if self.discovery_epoch < e {
-      self.discovery_epoch = e;
-      self.send(&leader, AckEpoch(*self.sync_epoch.read(), TxnId::lower_bound())); // FIXME
+    if self.accepted_epoch < e {
+      self.accepted_epoch = e;
+      self.send(&leader, AckEpoch(*self.current_epoch.read(), TxnId::lower_bound())); // FIXME
       self.phase = Synchronization;
     }
   }
@@ -597,21 +600,19 @@ impl ReplicaProcess {
   fn synchronization_process(&mut self) {
     let identity = HostId(0);
     let leader = HostId(0);
-
     // Receive from leader NewMaster(e, diff).
-    // If self.discovery_epoch != e, then transition to Discovery phase.
+    // If self.accepted_epoch != e, then transition to Discovery phase.
     let (e, diff) = match_until!(self.recv_from(&leader), NewMaster(e, diff) => (e, diff));
-    if e != self.discovery_epoch {
+    if e != self.accepted_epoch {
       self.phase = Discovery;
       return;
     }
-
     // Atomically:
-    // 1. set self.discovery_epoch = e,
+    // 1. set self.accepted_epoch = e,
     // 2. for each txn in diff, accept txn.
     // (If failure, then transition to Discovery phase.)
     let accepted_txns = {
-      let mut sync_epoch = self.sync_epoch.write();
+      let mut current_epoch = self.current_epoch.write();
       let mut accepted_txns = Vec::<Txn>::new();
       let mut diff_accepted = true;
       for txn in diff.move_iter() {
@@ -623,29 +624,26 @@ impl ReplicaProcess {
         }
       }
       if diff_accepted {
-        *sync_epoch = e;
+        *current_epoch = e;
       } else {
         self.phase = Discovery;
         return;
       }
       accepted_txns
     };
-
     // Send to leader AckMaster.
     let last_accepted_xid = match accepted_txns.last() {
       Some(ref txn) => txn.xid,
       None => TxnId::lower_bound(), // FIXME
     };
-    self.send(&leader, AckMaster(self.discovery_epoch, last_accepted_xid));
-
+    self.send(&leader, AckMaster(self.accepted_epoch, last_accepted_xid));
     // Receive from leader CommitMaster.
-    // (If self.discovery_epoch != e, then transition to Discovery phase.)
+    // (If self.accepted_epoch != e, then transition to Discovery phase.)
     let (e, xid) = match_until!(self.recv_from(&leader), CommitMaster(e, xid) => (e, xid));
-    if e != self.discovery_epoch { // FIXME and check xid is recent.
+    if e != self.accepted_epoch { // FIXME and check xid is recent.
       self.phase = Discovery;
       return;
     }
-
     // For each accepted txn, deliver txn.
     {
       let mut shared = self.shared.write();
@@ -653,7 +651,6 @@ impl ReplicaProcess {
         shared.history.push(txn);
       }
     }
-
     // Transition to Broadcast phase.
     // If self.infer_master() is itself, invoke self.ready(e).
     self.phase = Broadcast;
