@@ -257,8 +257,6 @@ pub struct ReplicaProcess {
   election_proposal: RWLock<Vote>,
   disc_epoch: Epoch,
   sync_epoch: RWLock<Epoch>,
-  received_set: HashMap<HostId, Vote>,
-  out_of_election: HashMap<HostId, Vote>,
   accepted_txns: TreeMap<TxnId, Txn>,
   ready_txns: TreeMap<TxnId, Txn>,
 }
@@ -280,8 +278,8 @@ impl ReplicaProcess {
       }),
       disc_epoch: 0,
       sync_epoch: RWLock::new(0),
-      received_set: HashMap::new(),
-      out_of_election: HashMap::new(),
+      //received_set: HashMap::new(),
+      //out_of_election: HashMap::new(),
       accepted_txns: TreeMap::new(),
       ready_txns: TreeMap::new(),
     }
@@ -298,14 +296,24 @@ impl ReplicaProcess {
     }
   }
 
-  pub fn total_order_predicate(&self, new_vote: &Vote, curr_vote: &Vote) -> bool {
+  fn initial_vote(&self) -> Vote {
+    Vote{
+      epoch: 0,
+      state: Voting,
+      leader: HostId(0),
+      leader_xid: TxnId::lower_bound(),
+      leader_epoch: 0,
+    }
+  }
+
+  fn total_order_predicate(&self, new_vote: &Vote, curr_vote: &Vote) -> bool {
     new_vote.leader_epoch > curr_vote.leader_epoch ||
     (new_vote.leader_epoch == curr_vote.leader_epoch &&
      (new_vote.leader_xid > curr_vote.leader_xid &&
       new_vote.leader > curr_vote.leader))
   }
 
-  pub fn termination_predicate(&self, votes: &HashMap<HostId, Vote>, fixed_vote: &Vote) -> bool {
+  fn termination_predicate(&self, votes: &HashMap<HostId, Vote>, fixed_vote: &Vote) -> bool {
     let mut potential_quorum = HashSet::<HostId>::new();
     for (&host, vote) in votes.iter() {
       if vote == fixed_vote {
@@ -315,7 +323,7 @@ impl ReplicaProcess {
     potential_quorum.len() >= self.config.quorum_min_size()
   }
 
-  pub fn valid_leader_predicate(&self, votes: &HashMap<HostId, Vote>, leader: HostId, maybe_epoch: Option<Epoch>) -> bool {
+  fn valid_leader_predicate(&self, votes: &HashMap<HostId, Vote>, leader: HostId, maybe_epoch: Option<Epoch>) -> bool {
     let election_proposal = self.election_proposal.read();
     if leader != self.config.identity {
       match votes.find(&leader) {
@@ -333,7 +341,7 @@ impl ReplicaProcess {
     }
   }
 
-  pub fn election_recv(&mut self) -> (HostId, ProtocolMsg) {
+  fn election_recv(&mut self) -> (HostId, ProtocolMsg) {
     loop {
       match self.recv() {
         // Receive vote notification from a peer.
@@ -366,35 +374,74 @@ impl ReplicaProcess {
     }
   }
 
+  fn election_notify_all(&mut self) {
+    self.send_all(Notify(*self.election_proposal.read()));
+  }
+
+  fn election_update_proposal(&mut self, new_vote: &Vote) {
+    let mut election_proposal = self.election_proposal.write();
+    *election_proposal = *new_vote;
+  }
+
   fn election_process(&mut self) {
+    let mut received_set = HashMap::<HostId, Vote>::new();
+    let mut out_of_election = HashMap::<HostId, Vote>::new();
+    let initial_vote = self.initial_vote();
     loop {
       let (host, vote) = match self.election_recv() {
         (host, Notify(vote)) => (host, vote),
         // If not enough notifications received, send more.
         (_, TimeoutAll) => {
-          self.send_all(Notify(*self.election_proposal.read()));
+          self.election_notify_all();
           continue;
         },
         _ => continue,
       };
+      let election_epoch = self.election_proposal.read().epoch;
+      match vote.state {
+        Voting => {
+          if vote.epoch > election_epoch {
+            self.election_proposal.write().epoch = vote.epoch;
+            received_set.clear();
+            if self.total_order_predicate(&vote, &initial_vote) {
+              self.election_update_proposal(&vote);
+            } else {
+              self.election_update_proposal(&initial_vote);
+            }
+            self.election_notify_all();
+          } else if vote.epoch < election_epoch {
+            break;
+          } else if self.total_order_predicate(&vote, &*self.election_proposal.read()) {
+            self.election_update_proposal(&vote);
+            self.election_notify_all();
+          }
+          received_set.insert(host, vote);
+          if self.termination_predicate(&received_set, &*self.election_proposal.read()) {
+            // TODO
+          }
+        },
+        Following | Leading => {
+          // Consider notifications from the same epoch.
+          if vote.epoch == election_epoch {
+            received_set.insert(host, vote);
+            if self.termination_predicate(&received_set, &vote) &&
+               self.valid_leader_predicate(&out_of_election, vote.leader, Some(vote.leader_epoch))
+            {
+              // TODO
+            }
+          }
+          // Verify that a quorum is following the same leader.
+          out_of_election.insert(host, vote); // FIXME
+          if self.termination_predicate(&out_of_election, &vote) &&
+             self.valid_leader_predicate(&out_of_election, vote.leader, None)
+          {
+            let mut election_proposal = self.election_proposal.write();
+            election_proposal.epoch = vote.epoch;
+            // TODO
+          }
+        },
+      }
     }
-    /*match vote.state {
-      Voting => {
-        if vote.epoch > self.vote_epoch {
-          // TODO
-        } else if vote.epoch < self.vote_epoch {
-          // TODO
-        } else if true { // FIXME
-        }
-      },
-      Following | Leading => {
-        // Consider notifications from the same epoch.
-        if vote.epoch == self.vote_epoch {
-        }
-        // Verify that a quorum is following the same leader.
-        // TODO
-      },
-    }*/
   }
 
   fn discovery_process(&mut self) {
