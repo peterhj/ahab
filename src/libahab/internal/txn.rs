@@ -12,7 +12,7 @@ pub struct TxnId {
 
 impl TxnId {
   pub fn lower_bound() -> TxnId {
-    TxnId{epoch: 0, index: 0}
+    TxnId{epoch: Epoch(0), index: 0}
   }
 }
 

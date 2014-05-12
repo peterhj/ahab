@@ -25,7 +25,21 @@ macro_rules! match_until (
   })
 )
 
-pub type Epoch = u64;
+//#[deriving(Clone, TotalEq, TotalOrd)]
+#[deriving(Clone, Eq, TotalEq, Ord, TotalOrd)]
+#[deriving(Decodable, Encodable)]
+pub struct Epoch(u64);
+
+impl Epoch {
+  pub fn inc(self) -> Epoch {
+    let curr: u64 = match self {
+      Epoch(e) => e,
+    };
+    let next = curr + 1;
+    assert!(next != 0);
+    Epoch(next)
+  }
+}
 
 #[deriving(Clone)]
 #[deriving(Decodable, Encodable)]
@@ -52,6 +66,14 @@ struct Vote {
   leader: HostId,
   leader_xid: TxnId,
   leader_epoch: Epoch,
+}
+
+impl Vote {
+  pub fn loosely_eq(&self, other: &Vote) -> bool {
+    self.state == other.state &&
+    self.leader == other.leader &&
+    self.leader_epoch == other.leader_epoch
+  }
 }
 
 #[deriving(Clone)]
@@ -110,7 +132,7 @@ impl MasterProcess {
       state: Voting,
       phase: Election,
       quorum: HashSet::new(),
-      epoch: 0,
+      epoch: Epoch(0),
     }
   }
 
@@ -141,13 +163,13 @@ impl MasterProcess {
 
     // Send to quorum NewEpoch(e') s.t. e' = max(e received from quorum) + 1.
     self.epoch = {
-      let mut sup_epoch: Epoch = 0;
+      let mut sup_epoch = Epoch(0);
       for (_, &e) in quorum_epochs.iter() {
         sup_epoch = max(sup_epoch, e);
       }
-      sup_epoch + 1
+      sup_epoch.inc()
     };
-    assert!(self.epoch != 0);
+    assert!(self.epoch != Epoch(0));
     for (host, _) in quorum_epochs.iter() {
       // FIXME read txn history from master process?
       self.send(host, NewEpoch(self.epoch, TxnId::lower_bound()));
@@ -309,6 +331,11 @@ impl Process<ProtocolMsg> for MasterProcess {
   }
 }
 
+enum ElectionTerminationMode {
+  Strict,
+  Loose,
+}
+
 pub struct ReplicaProcess {
   helper: ProcessHelper,
   config: Arc<StaticConfig>,
@@ -316,7 +343,7 @@ pub struct ReplicaProcess {
   state: State,
   phase: Phase,
   election_proposal: RWLock<Vote>,
-  disc_epoch: Epoch,
+  discovery_epoch: Epoch,
   sync_epoch: RWLock<Epoch>,
   accepted_txns: TreeMap<TxnId, Txn>,
   ready_txns: TreeMap<TxnId, Txn>,
@@ -331,16 +358,14 @@ impl ReplicaProcess {
       state: Voting,
       phase: Election,
       election_proposal: RWLock::new(Vote{ // FIXME
-        epoch: 0,
+        epoch: Epoch(0),
         state: Voting,
         leader: HostId(0),
         leader_xid: TxnId::lower_bound(),
-        leader_epoch: 0,
+        leader_epoch: Epoch(0),
       }),
-      disc_epoch: 0,
-      sync_epoch: RWLock::new(0),
-      //received_set: HashMap::new(),
-      //out_of_election: HashMap::new(),
+      discovery_epoch: Epoch(0),
+      sync_epoch: RWLock::new(Epoch(0)),
       accepted_txns: TreeMap::new(),
       ready_txns: TreeMap::new(),
     }
@@ -359,11 +384,11 @@ impl ReplicaProcess {
 
   fn initial_vote(&self) -> Vote {
     Vote{
-      epoch: 0,
+      epoch: Epoch(0),
       state: Voting,
       leader: HostId(0),
       leader_xid: TxnId::lower_bound(),
-      leader_epoch: 0,
+      leader_epoch: Epoch(0),
     }
   }
 
@@ -374,11 +399,20 @@ impl ReplicaProcess {
       new_vote.leader > curr_vote.leader))
   }
 
-  fn termination_predicate(&self, votes: &HashMap<HostId, Vote>, fixed_vote: &Vote) -> bool {
+  fn termination_predicate(&self, votes: &HashMap<HostId, Vote>, fixed_vote: &Vote, mode: ElectionTerminationMode) -> bool {
     let mut potential_quorum = HashSet::<HostId>::new();
     for (&host, vote) in votes.iter() {
-      if vote == fixed_vote {
-        potential_quorum.insert(host);
+      match mode {
+        Strict => {
+          if vote == fixed_vote {
+            potential_quorum.insert(host);
+          }
+        },
+        Loose => {
+          if vote.loosely_eq(fixed_vote) {
+            potential_quorum.insert(host);
+          }
+        },
       }
     }
     potential_quorum.len() >= self.config.quorum_min_size()
@@ -397,7 +431,7 @@ impl ReplicaProcess {
     } else {
       match maybe_epoch {
         Some(epoch) => epoch == election_proposal.epoch,
-        None => true,
+        None => false,
       }
     }
   }
@@ -486,7 +520,7 @@ impl ReplicaProcess {
             self.election_notify_all();
           }
           received_set.insert(host, vote);
-          if self.termination_predicate(&received_set, &*self.election_proposal.read()) {
+          if self.termination_predicate(&received_set, &*self.election_proposal.read(), Strict) {
             loop {
               match self.election_recv() {
                 (host, Notify(vote)) => {
@@ -511,7 +545,7 @@ impl ReplicaProcess {
           // Consider notifications from the same epoch.
           if vote.epoch == election_epoch {
             received_set.insert(host, vote);
-            if self.termination_predicate(&received_set, &vote) &&
+            if self.termination_predicate(&received_set, &vote, Strict) &&
                self.valid_leader_predicate(&out_of_election, vote.leader, Some(vote.leader_epoch))
             {
               if vote.leader == self.config.identity {
@@ -523,9 +557,8 @@ impl ReplicaProcess {
             }
           }
           // Verify that a quorum is following the same leader.
-          // FIXME lots of IGNORED values here.
           out_of_election.insert(host, vote);
-          if self.termination_predicate(&out_of_election, &vote) &&
+          if self.termination_predicate(&out_of_election, &vote, Loose) &&
              self.valid_leader_predicate(&out_of_election, vote.leader, None)
           {
             {
@@ -547,15 +580,15 @@ impl ReplicaProcess {
   fn discovery_process(&mut self) {
     let identity = HostId(0);
     let leader = HostId(0);
-    // Send to leader CurrentEpoch(self.disc_epoch).
-    self.send(&leader, CurrentEpoch(self.disc_epoch));
+    // Send to leader CurrentEpoch(self.discovery_epoch).
+    self.send(&leader, CurrentEpoch(self.discovery_epoch));
     // Receive from leader NewEpoch(e).
     let (e, last_xid) = match_until!(self.recv_from(&leader), NewEpoch(e, xid) => (e, xid));
-    // If self.disc_epoch < e, then set self.disc_epoch = e, send to
+    // If self.discovery_epoch < e, then set self.discovery_epoch = e, send to
     // leader AckEpoch(self.sync_epoch, diff), and transition to
     // Synchronization phase.
-    if self.disc_epoch < e {
-      self.disc_epoch = e;
+    if self.discovery_epoch < e {
+      self.discovery_epoch = e;
       self.send(&leader, AckEpoch(*self.sync_epoch.read(), TxnId::lower_bound())); // FIXME
       self.phase = Synchronization;
     }
@@ -566,15 +599,15 @@ impl ReplicaProcess {
     let leader = HostId(0);
 
     // Receive from leader NewMaster(e, diff).
-    // If self.disc_epoch != e, then transition to Discovery phase.
+    // If self.discovery_epoch != e, then transition to Discovery phase.
     let (e, diff) = match_until!(self.recv_from(&leader), NewMaster(e, diff) => (e, diff));
-    if e != self.disc_epoch {
+    if e != self.discovery_epoch {
       self.phase = Discovery;
       return;
     }
 
     // Atomically:
-    // 1. set self.disc_epoch = e,
+    // 1. set self.discovery_epoch = e,
     // 2. for each txn in diff, accept txn.
     // (If failure, then transition to Discovery phase.)
     let accepted_txns = {
@@ -603,12 +636,12 @@ impl ReplicaProcess {
       Some(ref txn) => txn.xid,
       None => TxnId::lower_bound(), // FIXME
     };
-    self.send(&leader, AckMaster(self.disc_epoch, last_accepted_xid));
+    self.send(&leader, AckMaster(self.discovery_epoch, last_accepted_xid));
 
     // Receive from leader CommitMaster.
-    // (If self.disc_epoch != e, then transition to Discovery phase.)
+    // (If self.discovery_epoch != e, then transition to Discovery phase.)
     let (e, xid) = match_until!(self.recv_from(&leader), CommitMaster(e, xid) => (e, xid));
-    if e != self.disc_epoch { // FIXME and check xid is recent.
+    if e != self.discovery_epoch { // FIXME and check xid is recent.
       self.phase = Discovery;
       return;
     }
