@@ -1,11 +1,10 @@
 use internal::config::{StaticConfig};
 use internal::network::{HostId};
 use internal::process::{Process, ProcessHelper};
+use internal::txn::{TxnId, Txn};
 
 use collections::hashmap::{HashMap, HashSet};
 use collections::treemap::{TreeMap};
-use serialize::{base64, Decodable, Decoder, Encodable, Encoder};
-use serialize::base64::{FromBase64, ToBase64};
 use std::cmp::{max};
 use sync::{Arc, RWLock};
 
@@ -28,89 +27,6 @@ macro_rules! match_until (
 
 pub type Epoch = u64;
 
-#[deriving(Clone, TotalEq, TotalOrd)]
-#[deriving(Decodable, Encodable)]
-pub struct TxnId {
-  epoch: Epoch,
-  tick: u64,
-}
-
-impl TxnId {
-  pub fn lower_bound() -> TxnId {
-    TxnId{epoch: 0, tick: 0}
-  }
-}
-
-impl Eq for TxnId {
-  fn eq(&self, other: &TxnId) -> bool {
-    self.epoch == other.epoch && self.tick == other.tick
-  }
-}
-
-impl Ord for TxnId {
-  fn lt(&self, other: &TxnId) -> bool {
-    self.epoch < other.epoch || (self.epoch == other.epoch && self.tick < other.tick)
-  }
-}
-
-#[deriving(Clone)]
-#[deriving(Decodable, Encodable)]
-pub enum TxnOp {
-  Put(TxnPutOp),
-  Delete(TxnDeleteOp),
-}
-
-#[deriving(Clone)]
-pub struct TxnPutOp {
-  key: ~str,
-  value: ~[u8],
-}
-
-impl<E, S: Encoder<E>> Encodable<S, E> for TxnPutOp {
-  fn encode(&self, s: &mut S) -> Result<(), E> {
-    match s.emit_str(self.key) {
-      Ok(()) => (),
-      Err(e) => return Err(e),
-    }
-    let value: &[u8] = self.value;
-    match s.emit_str(value.to_base64(base64::STANDARD)) {
-      Ok(()) => (),
-      Err(e) => return Err(e),
-    }
-    Ok(())
-  }
-}
-
-impl<E, D: Decoder<E>> Decodable<D, E> for TxnPutOp {
-  fn decode(d: &mut D) -> Result<TxnPutOp, E> {
-    // FIXME handle errors.
-    let key = d.read_str().ok().unwrap();
-    let value = d.read_str().ok().unwrap()
-        .from_base64().ok().unwrap();
-    let op = TxnPutOp{key: key, value: value};
-    Ok(op)
-  }
-}
-
-#[deriving(Clone)]
-#[deriving(Decodable, Encodable)]
-pub struct TxnDeleteOp {
-  key: ~str,
-}
-
-#[deriving(Clone)]
-#[deriving(Decodable, Encodable)]
-pub struct Txn {
-  xid: TxnId,
-  ops: Vec<TxnOp>,
-}
-
-impl Txn {
-  pub fn acceptable(&self) -> bool {
-    true
-  }
-}
-
 #[deriving(Clone)]
 #[deriving(Decodable, Encodable)]
 enum Phase {
@@ -120,7 +36,7 @@ enum Phase {
   Broadcast,
 }
 
-#[deriving(Clone)]
+#[deriving(Clone, Eq, TotalEq)]
 #[deriving(Decodable, Encodable)]
 enum State {
   Voting,
@@ -128,34 +44,24 @@ enum State {
   Leading,
 }
 
-#[deriving(Clone)]
+#[deriving(Clone, Eq, TotalEq)]
 #[deriving(Decodable, Encodable)]
 struct Vote {
-  leader: HostId,
-  xid: TxnId,
   epoch: Epoch,
-}
-
-struct SharedData {
-  history: Vec<Txn>,
-}
-
-impl SharedData {
-  pub fn new() -> SharedData {
-    SharedData{
-      history: Vec::new(),
-    }
-  }
+  state: State,
+  leader: HostId,
+  leader_xid: TxnId,
+  leader_epoch: Epoch,
 }
 
 #[deriving(Clone)]
 #[deriving(Decodable, Encodable)]
 pub enum ProtocolMsg {
+  KeepAlive,
   Timeout,
   TimeoutAll,
-  Heartbeat,
   // Leader election.
-  Notify(Epoch, State, Vote),
+  Notify(Vote),
   // Discovery phase.
   CurrentEpoch(Epoch),
   NewEpoch(Epoch, TxnId),
@@ -170,6 +76,18 @@ pub enum ProtocolMsg {
   Propose(Epoch, Txn),
   Ack(Epoch, TxnId),
   Commit(Epoch, TxnId),
+}
+
+struct SharedData {
+  history: Vec<Txn>,
+}
+
+impl SharedData {
+  pub fn new() -> SharedData {
+    SharedData{
+      history: Vec::new(),
+    }
+  }
 }
 
 pub struct MasterProcess {
@@ -309,7 +227,7 @@ impl Process<ProtocolMsg> for MasterProcess {
 
   fn recv(&self) -> (HostId, ProtocolMsg) {
     self.helper.recv();
-    (HostId(0), Heartbeat) // FIXME
+    (HostId(0), KeepAlive) // FIXME
   }
 
   fn process(&mut self) {
@@ -330,63 +248,94 @@ impl Process<ProtocolMsg> for MasterProcess {
   }
 }
 
-struct ElectionAtomicData {
-  epoch: Epoch,
-  state: State,
-  //proposal: Vote,
-}
-
-impl ElectionAtomicData {
-  pub fn new() -> ElectionAtomicData {
-    ElectionAtomicData{
-      epoch: 0,
-      state: Voting,
-    }
-  }
-}
-
-pub struct SlaveProcess {
+pub struct ReplicaProcess {
   helper: ProcessHelper,
   config: Arc<StaticConfig>,
   shared: Arc<RWLock<SharedData>>,
   state: State,
   phase: Phase,
-  election: RWLock<ElectionAtomicData>,
+  election_proposal: RWLock<Vote>,
   disc_epoch: Epoch,
-  sync_epoch: Epoch,
-  received_votes: HashMap<HostId, Vote>,
+  sync_epoch: RWLock<Epoch>,
+  received_set: HashMap<HostId, Vote>,
   out_of_election: HashMap<HostId, Vote>,
   accepted_txns: TreeMap<TxnId, Txn>,
   ready_txns: TreeMap<TxnId, Txn>,
 }
 
-impl SlaveProcess {
-  pub fn new(config: Arc<StaticConfig>, shared: Arc<RWLock<SharedData>>) -> SlaveProcess {
-    SlaveProcess{
+impl ReplicaProcess {
+  pub fn new(config: Arc<StaticConfig>, shared: Arc<RWLock<SharedData>>) -> ReplicaProcess {
+    ReplicaProcess{
       helper: ProcessHelper::new(),
       config: config,
       shared: shared,
       state: Voting,
       phase: Election,
-      election: RWLock::new(ElectionAtomicData::new()),
+      election_proposal: RWLock::new(Vote{ // FIXME
+        epoch: 0,
+        state: Voting,
+        leader: HostId(0),
+        leader_xid: TxnId::lower_bound(),
+        leader_epoch: 0,
+      }),
       disc_epoch: 0,
-      sync_epoch: 0,
-      received_votes: HashMap::new(),
+      sync_epoch: RWLock::new(0),
+      received_set: HashMap::new(),
       out_of_election: HashMap::new(),
       accepted_txns: TreeMap::new(),
       ready_txns: TreeMap::new(),
     }
   }
 
+  pub fn infer_master(&self) -> HostId {
+    HostId(0)
+  }
+
   pub fn send_all(&self, msg: ProtocolMsg) {
     for (host, _) in self.config.hosts.iter() {
+      // FIXME to itself too?
       self.send(host, msg.clone());
     }
   }
 
-  pub fn recv_notify(&mut self) -> (HostId, ProtocolMsg) {
+  pub fn total_order_predicate(&self, new_vote: &Vote, curr_vote: &Vote) -> bool {
+    new_vote.leader_epoch > curr_vote.leader_epoch ||
+    (new_vote.leader_epoch == curr_vote.leader_epoch &&
+     (new_vote.leader_xid > curr_vote.leader_xid &&
+      new_vote.leader > curr_vote.leader))
+  }
+
+  pub fn termination_predicate(&self, votes: &HashMap<HostId, Vote>, fixed_vote: &Vote) -> bool {
+    let mut potential_quorum = HashSet::<HostId>::new();
+    for (&host, vote) in votes.iter() {
+      if vote == fixed_vote {
+        potential_quorum.insert(host);
+      }
+    }
+    potential_quorum.len() >= self.config.quorum_min_size()
+  }
+
+  pub fn valid_leader_predicate(&self, votes: &HashMap<HostId, Vote>, leader: HostId, maybe_epoch: Option<Epoch>) -> bool {
+    let election_proposal = self.election_proposal.read();
+    if leader != self.config.identity {
+      match votes.find(&leader) {
+        Some(vote) => match vote.state {
+          Leading => true,
+          _ => false,
+        },
+        None => false,
+      }
+    } else {
+      match maybe_epoch {
+        Some(epoch) => epoch == election_proposal.epoch,
+        None => true,
+      }
+    }
+  }
+
+  pub fn election_recv(&mut self) -> (HostId, ProtocolMsg) {
     loop {
-      /*match self.recv() {
+      match self.recv() {
         // Receive vote notification from a peer.
         (host, Notify(vote)) => {
           let peer_is_looking = match vote.state {
@@ -399,90 +348,37 @@ impl SlaveProcess {
             // lagged, then respond with the leader candidate.
             Voting => {
               if peer_is_looking && peer_is_lagged {
-                self.send(&host, Notify(self.vote()));
+                self.send(&host, Notify(*self.election_proposal.read()));
               }
             },
             // Otherwise, if the peer is looking, then respond with the
             // proposed leader.
             _ => {
               if peer_is_looking {
-                self.send(&host, Notify(self.final_vote()));
+                self.send(&host, Notify(*self.election_proposal.read()));
               }
             },
           }
           return (host, Notify(vote));
         },
         _ => (),
-      }*/
-    }
-  }
-
-  pub fn predicate_total_order(&self, other: &Vote) -> bool {
-    /*if false {
-    //if weight of other == 0 {
-      false
-    } else {
-      let vote = self.vote();
-      other.leader_epoch > vote.leader_epoch ||
-      (other.leader_epoch == vote.leader_epoch &&
-       (other.leader_xid > vote.leader_xid &&
-        other.leader > other.leader))
-    }*/
-    true
-  }
-
-  pub fn predicate_termination(&self, votes: &HashMap<HostId, Vote>) -> bool {
-    true
-  }
-
-  pub fn predicate_valid_leader(&self, votes: &HashMap<HostId, Vote>, leader: HostId, epoch: Epoch) -> bool {
-    /*if leader != self.config.identity {
-      match votes.find(&leader) {
-        Some(vote) => match vote.state {
-          Leading => true,
-          _ => false,
-        },
-        None => false,
       }
-    } else if epoch != self.vote_epoch {
-      false
-    } else {
-      true
-    }*/
-    true
-  }
-
-  pub fn infer_master(&self) -> HostId {
-    HostId(0)
-  }
-
-  /*pub fn vote(&self) -> Vote {
-    Vote{
-      leader: HostId(0),
-      xid: TxnId{epoch: 0, tick: 0},
-      epoch: 0,
     }
   }
-
-  pub fn final_vote(&self) -> Vote {
-    Vote{
-      leader: HostId(0),
-      xid: TxnId{epoch: 0, tick: 0},
-      epoch: 0,
-    }
-  }*/
 
   fn election_process(&mut self) {
-    /*let (host, vote) = match self.recv_notify() {
-      (host, Notify(vote)) => (host, vote),
-      // If not enough notifications received, send more.
-      (_, TimeoutAll) => {
-        self.send_all(Notify(self.vote()));
-        continue;
-      },
-      _ => continue,
-    };
-    match vote.state {
+    loop {
+      let (host, vote) = match self.election_recv() {
+        (host, Notify(vote)) => (host, vote),
+        // If not enough notifications received, send more.
+        (_, TimeoutAll) => {
+          self.send_all(Notify(*self.election_proposal.read()));
+          continue;
+        },
+        _ => continue,
+      };
+    }
+    /*match vote.state {
       Voting => {
         if vote.epoch > self.vote_epoch {
           // TODO
@@ -513,7 +409,7 @@ impl SlaveProcess {
     // Synchronization phase.
     if self.disc_epoch < e {
       self.disc_epoch = e;
-      self.send(&leader, AckEpoch(self.sync_epoch, TxnId::lower_bound())); // FIXME
+      self.send(&leader, AckEpoch(*self.sync_epoch.read(), TxnId::lower_bound())); // FIXME
       self.phase = Synchronization;
     }
   }
@@ -535,6 +431,7 @@ impl SlaveProcess {
     // 2. for each txn in diff, accept txn.
     // (If failure, then transition to Discovery phase.)
     let accepted_txns = {
+      let mut sync_epoch = self.sync_epoch.write();
       let mut accepted_txns = Vec::<Txn>::new();
       let mut diff_accepted = true;
       for txn in diff.move_iter() {
@@ -546,7 +443,7 @@ impl SlaveProcess {
         }
       }
       if diff_accepted {
-        self.sync_epoch = e;
+        *sync_epoch = e;
       } else {
         self.phase = Discovery;
         return;
@@ -623,13 +520,13 @@ impl SlaveProcess {
   }
 }
 
-impl Process<ProtocolMsg> for SlaveProcess {
+impl Process<ProtocolMsg> for ReplicaProcess {
   fn send(&self, dest: &HostId, msg: ProtocolMsg) {
   }
 
   fn recv(&self) -> (HostId, ProtocolMsg) {
     self.helper.recv();
-    (HostId(0), Heartbeat) // FIXME
+    (HostId(0), KeepAlive) // FIXME
   }
 
   fn process(&mut self) {

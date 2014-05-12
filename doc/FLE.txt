@@ -51,19 +51,15 @@ while GetPeerState() == VOTING {
                 break
               }
             },
-            None => break,
+            None => {
+              if proposed_leader == GetId() {
+                SetPeerState(LEADING)
+              } else {
+                SetPeerState(FOLLOWING)
+              }
+              return LeaveInstance(Vote(proposed_leader, proposed_xid, proposed_epoch))
+            },
           }
-          if n'.IsNone() {
-            break
-          }
-        }
-        if n'.IsNone() {
-          if proposed_leader == GetId() {
-            SetPeerState(LEADING)
-          } else {
-            SetPeerState(FOLLOWING)
-          }
-          return LeaveInstance(Vote(proposed_leader, proposed_xid, proposed_epoch))
         }
       }
     },
