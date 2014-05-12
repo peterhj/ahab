@@ -42,12 +42,11 @@ while GetPeerState() == VOTING {
       }
       received_set.Put(n.sid, VOTING, (n.election_epoch, Vote(n.leader, n.xid, n.peer_epoch)))
       if TerminationPredicate(received_set, (logical_clock, Vote(proposed_leader, proposed_xid, proposed_epoch))) {
-        let mut n'
         loop {
-          n' = PeekNotification()
-          match n' {
+          match RecvNotification() {
             Some(n') => {
               if TotalOrderPredicate(Vote(n'.leader, n'.xid, n'.peer_epoch), Vote(proposed_leader, proposed_xid, proposed_epoch)) {
+                EnqueueNotification(n')
                 break
               }
             },

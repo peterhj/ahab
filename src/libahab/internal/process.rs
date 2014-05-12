@@ -34,6 +34,7 @@ impl ProcessHelper {
   pub fn send(&self, dest: &HostId, msg: NetworkMsg) {
   }
 
-  pub fn recv(&self) { // -> (HostId, NetworkMsg) {
+  pub fn recv(&self) -> (HostId, NetworkMsg) {
+    (HostId(0), NetworkMsg{value: ~[]}) // FIXME
   }
 }

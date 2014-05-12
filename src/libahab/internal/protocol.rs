@@ -383,6 +383,14 @@ impl ReplicaProcess {
     *election_proposal = *new_vote;
   }
 
+  fn election_leave(&mut self, final_vote: &Vote) {
+    assert!(match self.state {
+      Voting => false,
+      Following | Leading => true,
+    });
+    self.phase = Discovery;
+  }
+
   fn election_process(&mut self) {
     let mut received_set = HashMap::<HostId, Vote>::new();
     let mut out_of_election = HashMap::<HostId, Vote>::new();
@@ -400,6 +408,7 @@ impl ReplicaProcess {
       let election_epoch = self.election_proposal.read().epoch;
       match vote.state {
         Voting => {
+          // If notification > current, replace and send messages out.
           if vote.epoch > election_epoch {
             self.election_proposal.write().epoch = vote.epoch;
             received_set.clear();
@@ -417,7 +426,24 @@ impl ReplicaProcess {
           }
           received_set.insert(host, vote);
           if self.termination_predicate(&received_set, &*self.election_proposal.read()) {
-            // TODO
+            loop {
+              match self.election_recv() {
+                (host, Notify(vote)) => {
+                  self.send(&self.config.identity, Notify(vote));
+                  break;
+                },
+                (_, TimeoutAll) => {
+                  if self.election_proposal.read().leader == self.config.identity {
+                    self.state = Leading;
+                  } else {
+                    self.state = Following;
+                  }
+                  let proposal = *self.election_proposal.read();
+                  return self.election_leave(&proposal);
+                },
+                _ => (),
+              }
+            }
           }
         },
         Following | Leading => {
@@ -427,17 +453,30 @@ impl ReplicaProcess {
             if self.termination_predicate(&received_set, &vote) &&
                self.valid_leader_predicate(&out_of_election, vote.leader, Some(vote.leader_epoch))
             {
-              // TODO
+              if vote.leader == self.config.identity {
+                self.state = Leading;
+              } else {
+                self.state = Following;
+              }
+              return self.election_leave(&vote);
             }
           }
           // Verify that a quorum is following the same leader.
-          out_of_election.insert(host, vote); // FIXME
+          // FIXME lots of IGNORED values here.
+          out_of_election.insert(host, vote);
           if self.termination_predicate(&out_of_election, &vote) &&
              self.valid_leader_predicate(&out_of_election, vote.leader, None)
           {
-            let mut election_proposal = self.election_proposal.write();
-            election_proposal.epoch = vote.epoch;
-            // TODO
+            {
+              let mut election_proposal = self.election_proposal.write();
+              if vote.leader == self.config.identity {
+                self.state = Leading;
+              } else {
+                self.state = Following;
+              }
+              election_proposal.epoch = vote.epoch;
+            }
+            return self.election_leave(&vote);
           }
         },
       }

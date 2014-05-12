@@ -35,6 +35,5 @@ pub struct Quorum {
 }
 
 pub struct NetworkMsg {
-  dest: HostAddr,
   value: ~[u8],
 }
