@@ -70,9 +70,10 @@ pub enum ProtocolMsg {
   AckEpochHistory(Epoch, Vec<Txn>),
   // Synchronization phase.
   NewMaster(Epoch, Vec<Txn>),
-  AckMaster(Epoch),
-  CommitMaster(Epoch),
+  AckMaster(Epoch, TxnId),
+  CommitMaster(Epoch, TxnId),
   // Broadcast phase.
+  Submit(Txn),
   Propose(Epoch, Txn),
   Ack(Epoch, TxnId),
   Commit(Epoch, TxnId),
@@ -201,7 +202,7 @@ impl MasterProcess {
     // (Receive from chosen follower AckEpochHistory(e', diff).)
     let (e, diff) = match_until!(self.recv_from(&chosen_host), AckEpochHistory(e, diff) => (e, diff));
     assert!(e == self.epoch);
-    // TODO adjust the dual follower history w/ the diff.
+    // TODO adjust the colo follower history w/ the diff.
 
     // Transition to Synchronization phase.
     self.phase = Synchronization;
@@ -209,15 +210,75 @@ impl MasterProcess {
 
   fn synchronization_process(&mut self) {
     // Send to quorum NewMaster(e', diff).
+    let last_xid = TxnId::lower_bound(); // FIXME
+    for host in self.quorum.iter() {
+      let diff = Vec::new();
+      self.send(host, NewMaster(self.epoch, diff)); // FIXME
+    }
     // Receive from quorum AckMaster(e', diff), send to quorum
     // CommitMaster(e', diff), and transition to Broadcast phase.
+    let mut quorum_acks = HashMap::<HostId, (Epoch, TxnId)>::new();
+    loop {
+      match self.recv() {
+        (host, AckMaster(e, xid)) => {
+          if self.quorum.contains(&host) {
+            if e == self.epoch && xid == last_xid {
+              quorum_acks.insert(host, (e, xid));
+              if quorum_acks.len() >= self.config.quorum_min_size() {
+                self.phase = Broadcast;
+                return;
+              }
+            } else {
+              self.phase = Discovery;
+              return;
+            }
+          }
+        },
+        _ => (),
+      }
+    }
   }
 
   fn broadcast_process(&mut self) {
-    // Receive from primary process a proposed txn.
-    // Send to quorum Propose(e', txn).
-    // Receive from quorum Ack(e', txn).
-    // Send to all followers Commit(e', txn).
+    loop {
+      match self.recv() {
+        (host, KeepAlive) => {
+          // TODO
+        },
+        (host, Timeout) => {
+          // TODO
+        },
+        (_, TimeoutAll) => {
+          // TODO
+        },
+        // Receive from primary process a proposed txn.
+        (host, Submit(txn)) => {
+          // Send to quorum Propose(e', txn).
+          for host in self.quorum.iter() {
+            self.send(host, Propose(self.epoch, txn.clone()));
+          }
+        },
+        // Receive from quorum Ack(e', txn).
+        (host, Ack(e, txn)) => {
+          // Send to all followers Commit(e', txn).
+          if e == self.epoch {
+            for host in self.quorum.iter() {
+              self.send(host, Commit(self.epoch, txn.clone()));
+            }
+          }
+        }
+        (host, CurrentEpoch(e)) => {
+          let last_xid = TxnId::lower_bound(); // FIXME
+          self.send(&host, NewEpoch(self.epoch, last_xid));
+        },
+        (host, AckEpoch(e, xid)) => {
+          if e == self.epoch {
+            self.send(&host, NewMaster(self.epoch, Vec::new())); // FIXME
+          }
+        }
+        _ => (),
+      }
+    }
   }
 }
 
@@ -438,8 +499,8 @@ impl ReplicaProcess {
                   } else {
                     self.state = Following;
                   }
-                  let proposal = *self.election_proposal.read();
-                  return self.election_leave(&proposal);
+                  let election_proposal = *self.election_proposal.read();
+                  return self.election_leave(&election_proposal);
                 },
                 _ => (),
               }
@@ -538,12 +599,16 @@ impl ReplicaProcess {
     };
 
     // Send to leader AckMaster.
-    self.send(&leader, AckMaster(self.disc_epoch));
+    let last_accepted_xid = match accepted_txns.last() {
+      Some(ref txn) => txn.xid,
+      None => TxnId::lower_bound(), // FIXME
+    };
+    self.send(&leader, AckMaster(self.disc_epoch, last_accepted_xid));
 
     // Receive from leader CommitMaster.
     // (If self.disc_epoch != e, then transition to Discovery phase.)
-    let e = match_until!(self.recv_from(&leader), CommitMaster(e) => e);
-    if e != self.disc_epoch {
+    let (e, xid) = match_until!(self.recv_from(&leader), CommitMaster(e, xid) => (e, xid));
+    if e != self.disc_epoch { // FIXME and check xid is recent.
       self.phase = Discovery;
       return;
     }
