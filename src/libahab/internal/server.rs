@@ -21,9 +21,8 @@ impl Server {
     let mut router = ProcessRouter::<ProtocolMsg>::new();
     router.register(MASTER_PORT, master);
     router.register(REPLICA_PORT, replica);
-    let server = Server{
+    Server{
       router: router,
-    };
-    server
+    }
   }
 }

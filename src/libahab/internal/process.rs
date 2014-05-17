@@ -42,7 +42,7 @@ pub struct ProcessId {
 }
 
 pub struct NetworkMsg {
-  value: Vec<u8>,
+  bytes: ~[u8],
 }
 
 pub struct NetworkSender {
@@ -82,6 +82,13 @@ impl ProcessHelper {
       net_chan: chan,
       net_port: port,
     }
+  }
+
+  pub fn send(&self, msg: NetworkMsg) {
+  }
+
+  pub fn recv(&self) -> NetworkMsg {
+    NetworkMsg{bytes: ~[]}
   }
 }
 

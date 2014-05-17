@@ -4,7 +4,10 @@ use internal::txn::{Txn, TxnId};
 
 use collections::hashmap::{HashMap, HashSet};
 use collections::treemap::{TreeMap};
+use serialize::json;
+use serialize::json::{ToJson};
 use std::cmp::{max};
+use std::str;
 use sync::{Arc, RWLock};
 
 pub static MASTER_PORT: ProcessPort     = ProcessPort(1);
@@ -116,9 +119,20 @@ impl ProtocolHelper {
   }
 
   pub fn send(&self, dest: &HostId, msg: ProtocolMsg) {
+    let enc_bytes = json::Encoder::buffer_encode(&msg);
+    let raw_msg = NetworkMsg{bytes: enc_bytes};
+    self.inner.send(raw_msg);
   }
 
   pub fn recv(&self) -> (HostId, ProtocolMsg) {
+    let raw_msg = self.inner.recv();
+    let json_str = unsafe {
+      str::raw::from_utf8_owned(raw_msg.bytes)
+    };
+    let json = json_str.to_json();
+    let mut decoder = json::Decoder::new(json);
+    // FIXME
+    //let msg: ProtocolMsg = decoder.read_enum("ProtocolMsg", ||);
     (HostId(0), KeepAlive) // FIXME
   }
 }
