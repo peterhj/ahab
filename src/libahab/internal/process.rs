@@ -50,12 +50,12 @@ pub struct NetworkSender {
 }
 
 pub struct NetworkReceiver {
+  listener: TcpListener,
   master_chan: Sender<NetworkMsg>,
   replica_chan: Sender<NetworkMsg>,
-  listener: TcpListener,
 }
 
-pub trait Process<T> {
+pub trait Process<T: Send> {
   fn send(&self, dest: &HostId, msg: T);
   fn recv(&self) -> (HostId, T);
   fn process(&mut self);
@@ -90,4 +90,13 @@ pub struct ProcessRouter<T> {
 }
 
 impl<T: Send> ProcessRouter<T> {
+  pub fn new() -> ProcessRouter<T> {
+    ProcessRouter{
+      procs: HashMap::new(),
+    }
+  }
+
+  pub fn register(&mut self, port: ProcessPort, process: ~Process<T>) {
+    self.procs.insert(port, process);
+  }
 }

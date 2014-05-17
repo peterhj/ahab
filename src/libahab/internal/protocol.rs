@@ -1,11 +1,14 @@
 use internal::config::{StaticConfig};
-use internal::process::{HostId, NetworkMsg, Process, ProcessHelper, ProcessId};
-use internal::txn::{TxnId, Txn};
+use internal::process::{HostId, NetworkMsg, Process, ProcessHelper, ProcessId, ProcessPort};
+use internal::txn::{Txn, TxnId};
 
 use collections::hashmap::{HashMap, HashSet};
 use collections::treemap::{TreeMap};
 use std::cmp::{max};
 use sync::{Arc, RWLock};
+
+pub static MASTER_PORT: ProcessPort     = ProcessPort(1);
+pub static REPLICA_PORT: ProcessPort    = ProcessPort(2);
 
 macro_rules! match_until (
   ($e:expr, $p:ident($($lhs:pat),*) => $rhs:expr) => ({
@@ -120,7 +123,7 @@ impl ProtocolHelper {
   }
 }
 
-struct SharedData {
+pub struct SharedData {
   history: Vec<Txn>,
 }
 
