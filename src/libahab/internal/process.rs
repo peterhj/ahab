@@ -1,6 +1,59 @@
-use internal::network::{HostId, NetworkMsg};
+use collections::hashmap::{HashMap};
+use std::io::net::ip::{Ipv4Addr, SocketAddr};
+use std::io::net::tcp::{TcpListener, TcpStream};
 
-pub type ProcessId = u32;
+#[deriving(Clone, Eq, TotalEq, Ord, TotalOrd)]
+#[deriving(Hash, Decodable, Encodable)]
+pub struct HostId(u32);
+
+#[deriving(Clone, Eq, TotalEq)]
+#[deriving(Hash)]
+pub struct HostAddr {
+  sockaddr: SocketAddr,
+}
+
+impl HostAddr {
+  pub fn new(ip0: u8, ip1: u8, ip2: u8, ip3: u8, port: u16) -> HostAddr {
+    HostAddr{
+      sockaddr: SocketAddr{ip: Ipv4Addr(ip0, ip1, ip2, ip3), port: port},
+    }
+  }
+
+  pub fn default() -> HostAddr {
+    HostAddr::new(127, 0, 0, 1, 6379)
+  }
+}
+
+#[deriving(Clone)]
+pub struct HostInfo {
+  id: HostId,
+  addr: HostAddr,
+}
+
+#[deriving(Clone, Eq, TotalEq)]
+#[deriving(Hash)]
+pub struct ProcessPort(u32);
+
+#[deriving(Clone, Eq, TotalEq)]
+#[deriving(Hash)]
+pub struct ProcessId {
+  host: HostId,
+  port: ProcessPort,
+}
+
+pub struct NetworkMsg {
+  value: Vec<u8>,
+}
+
+pub struct NetworkSender {
+  port: Receiver<NetworkMsg>,
+}
+
+pub struct NetworkReceiver {
+  master_chan: Sender<NetworkMsg>,
+  replica_chan: Sender<NetworkMsg>,
+  listener: TcpListener,
+}
 
 pub trait Process<T> {
   fn send(&self, dest: &HostId, msg: T);
@@ -24,17 +77,17 @@ pub struct ProcessHelper {
 
 impl ProcessHelper {
   pub fn new() -> ProcessHelper {
-    let (net_chan, net_port) = channel::<NetworkMsg>();
+    let (chan, port) = channel::<NetworkMsg>();
     ProcessHelper{
-      net_chan: net_chan,
-      net_port: net_port,
+      net_chan: chan,
+      net_port: port,
     }
   }
+}
 
-  pub fn send(&self, dest: &HostId, msg: NetworkMsg) {
-  }
+pub struct ProcessRouter<T> {
+  procs: HashMap<ProcessPort, ~Process<T>>,
+}
 
-  pub fn recv(&self) -> (HostId, NetworkMsg) {
-    (HostId(0), NetworkMsg{value: ~[]}) // FIXME
-  }
+impl<T: Send> ProcessRouter<T> {
 }

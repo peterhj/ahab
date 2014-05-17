@@ -1,4 +1,4 @@
-use internal::network::{HostAddr, HostId, HostInfo};
+use internal::process::{HostAddr, HostId, HostInfo};
 
 use collections::hashmap::{HashMap};
 

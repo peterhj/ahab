@@ -1,6 +1,5 @@
 use internal::config::{StaticConfig};
-use internal::network::{HostId};
-use internal::process::{Process, ProcessHelper};
+use internal::process::{HostId, NetworkMsg, Process, ProcessHelper, ProcessId};
 use internal::txn::{TxnId, Txn};
 
 use collections::hashmap::{HashMap, HashSet};
@@ -100,6 +99,27 @@ pub enum ProtocolMsg {
   Commit(Epoch, TxnId),
 }
 
+pub struct ProtocolHelper {
+  inner: ProcessHelper,
+  last_msg_times: HashMap<ProcessId, u32>,
+}
+
+impl ProtocolHelper {
+  pub fn new() -> ProtocolHelper {
+    ProtocolHelper{
+      inner: ProcessHelper::new(),
+      last_msg_times: HashMap::new(),
+    }
+  }
+
+  pub fn send(&self, dest: &HostId, msg: ProtocolMsg) {
+  }
+
+  pub fn recv(&self) -> (HostId, ProtocolMsg) {
+    (HostId(0), KeepAlive) // FIXME
+  }
+}
+
 struct SharedData {
   history: Vec<Txn>,
 }
@@ -113,7 +133,7 @@ impl SharedData {
 }
 
 pub struct MasterProcess {
-  helper: ProcessHelper,
+  helper: ProtocolHelper,
   config: Arc<StaticConfig>,
   shared: Arc<RWLock<SharedData>>,
   state: State,
@@ -125,7 +145,7 @@ pub struct MasterProcess {
 impl MasterProcess {
   pub fn new(config: Arc<StaticConfig>, shared: Arc<RWLock<SharedData>>) -> MasterProcess {
     MasterProcess{
-      helper: ProcessHelper::new(),
+      helper: ProtocolHelper::new(),
       config: config,
       shared: shared,
       state: Voting,
@@ -180,11 +200,6 @@ impl MasterProcess {
             if self.quorum.contains(&host) {
               quorum_xids.insert(host, xid);
             }
-            if quorum_xids.len() == self.config.quorum_max_size() {
-              break;
-            }
-          },
-          Timeout => {
             if quorum_xids.len() >= self.config.quorum_min_size() {
               break;
             }
@@ -329,7 +344,7 @@ enum ElectionTerminationMode {
 }
 
 pub struct ReplicaProcess {
-  helper: ProcessHelper,
+  helper: ProtocolHelper,
   config: Arc<StaticConfig>,
   shared: Arc<RWLock<SharedData>>,
   state: State,
@@ -344,7 +359,7 @@ pub struct ReplicaProcess {
 impl ReplicaProcess {
   pub fn new(config: Arc<StaticConfig>, shared: Arc<RWLock<SharedData>>) -> ReplicaProcess {
     ReplicaProcess{
-      helper: ProcessHelper::new(),
+      helper: ProtocolHelper::new(),
       config: config,
       shared: shared,
       state: Voting,
@@ -437,7 +452,7 @@ impl ReplicaProcess {
             Voting => true,
             _ => false,
           };
-          let peer_is_lagged = true; // FIXME
+          let peer_is_lagged = vote.epoch < self.election_proposal.read().epoch;
           match self.state {
             // If self is looking, the peer is looking, and the peer is
             // lagged, then respond with the leader candidate.
